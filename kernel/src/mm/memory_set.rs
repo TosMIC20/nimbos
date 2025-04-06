@@ -168,20 +168,6 @@ impl MemorySet {
         }
     }
 
-    pub fn insert_sync(&mut self, area: MapArea) {
-        if area.size > 0 {
-            // TODO: check overlap
-            if let Entry::Vacant(e) = self.areas.entry(area.start) {
-                self.pt.map_area_sync(e.insert(area));
-            } else {
-                panic!(
-                    "MemorySet::insert: MepArea starts from {:#x?} is existed!",
-                    area.start
-                );
-            }
-        }
-    }
-
     pub fn load_user(&mut self, elf_data: &[u8]) -> (VirtAddr, VirtAddr) {
         use xmas_elf::program::{Flags, SegmentData, Type};
         use xmas_elf::{header, ElfFile};
@@ -234,25 +220,25 @@ impl MemorySet {
                 _ => panic!("failed to get ELF segment data"),
             };
 
+            let mut flags: MemFlags = ph.flags().into();
+            if !ph.flags().is_execute() {
+                flags |= MemFlags::SYNC;
+            }
+
             let mut area = MapArea::new_framed(
                 area_start,
                 area_end.as_usize() - area_start.as_usize(),
-                ph.flags().into(),
+                flags,
             );
             area.write_data(offset, data);
-            if ph.flags().is_execute() {
-                // no need to sync code area with shadow
-                self.insert(area);
-            } else {
-                self.insert_sync(area);
-            }
+            self.insert(area);
             instructions::flush_icache_all();
         }
         // user stack
-        self.insert_sync(MapArea::new_framed(
+        self.insert(MapArea::new_framed(
             VirtAddr::new(USER_STACK_BASE),
             USER_STACK_SIZE,
-            MemFlags::READ | MemFlags::WRITE | MemFlags::USER,
+            MemFlags::READ | MemFlags::WRITE | MemFlags::USER | MemFlags::SYNC,
         ));
 
         let entry = VirtAddr::new(elf.header.pt2.entry_point() as usize);

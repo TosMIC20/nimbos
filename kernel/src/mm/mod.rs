@@ -20,6 +20,7 @@ bitflags::bitflags! {
         const EXECUTE       = 1 << 2;
         const USER          = 1 << 3;
         const DEVICE        = 1 << 4;
+        const SYNC          = 1 << 5;
     }
 }
 
