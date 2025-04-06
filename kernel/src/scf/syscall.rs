@@ -15,6 +15,7 @@ numeric_enum_macro::numeric_enum! {
         Write = 2,
         Open = 3,
         Close = 4,
+        SyncMap = 5,
         Unknown = 0xff,
     }
 }
@@ -58,6 +59,13 @@ struct ReadWriteArgs {
 fn send_request(opcode: ScfOpcode, args: u64, token: ScfRequestToken) {
     while !SyscallQueueBuffer::get().send(opcode, args, token) {
         CurrentTask::get().yield_now();
+    }
+    super::notify();
+}
+
+fn send_request_kernel(opcode: ScfOpcode, args: u64, token: ScfRequestToken) {
+    while !SyscallQueueBuffer::get().send(opcode, args, token) {
+        core::hint::spin_loop();
     }
     super::notify();
 }
@@ -108,4 +116,41 @@ pub fn sys_read(fd: usize, mut buf: UserOutPtr<u8>, len: usize) -> isize {
         pool.dealloc(args);
     }
     ret as _
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct SyncMapArgs {
+    vaddr: u64,
+    len: u64,
+    paddr: u64,
+    prot: i32,
+}
+
+pub fn sys_syncmap(vaddr: usize, len: usize, paddr: usize, prot: usize) -> isize {
+    debug!("sys_syncmap: vaddr={:#x}, len={:#x}, paddr={:#x}, prot={:#x}", vaddr, len, paddr, prot);
+    let pool = SyscallDataBuffer::get();
+    let args = pool.alloc(SyncMapArgs {
+        vaddr: vaddr as _,
+        len: len as _,
+        paddr: paddr as _,
+        prot: prot as _,
+    });
+    let cond = SyscallCondVar::new();
+    send_request_kernel(
+        ScfOpcode::SyncMap,
+        pool.offset_of(args),
+        ScfRequestToken::from(&cond),
+    );
+
+    // Better waiting strategy?
+    loop {
+        let response = SyscallQueueBuffer::get().pop_response();
+        if response.is_some() {
+            let scf_response = response.unwrap();
+            let ret = scf_response.ret_val;
+            debug!("sys_syncmap: response received: ret={:#x}", ret);
+            return ret as _;
+        }
+    }
 }

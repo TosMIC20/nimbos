@@ -1,6 +1,8 @@
 use alloc::{vec, vec::Vec};
 use core::{fmt::Debug, marker::PhantomData};
 
+use crate::scf::sys_syncmap;
+
 use super::{MapArea, MemFlags, PhysAddr, PhysFrame, VirtAddr, PAGE_SIZE};
 
 pub trait GenericPTE: Debug + Clone + Copy + Sync + Send + Sized {
@@ -105,6 +107,21 @@ impl<PTE: GenericPTE> PageTableImpl<PTE> {
         let end = vaddr + area.size;
         while vaddr < end {
             let paddr = area.map(VirtAddr::new(vaddr));
+            self.map(VirtAddr::new(vaddr), paddr, area.flags);
+            vaddr += PAGE_SIZE;
+        }
+    }
+
+    pub fn map_area_sync(&mut self, area: &mut MapArea) {
+        let mut vaddr = area.start.as_usize();
+        let end = vaddr + area.size;
+        while vaddr < end {
+            let paddr = area.map(VirtAddr::new(vaddr));
+            let prot = area.flags.bits & 0x7;
+            let ret = sys_syncmap(vaddr as _, PAGE_SIZE as _, paddr.as_usize(), prot);
+            if ret != 0 {
+                panic!("syncmap failed: addr={:x}, len={:x}, paddr={:x}, flags={:x}, ret={}", vaddr, PAGE_SIZE, paddr.as_usize(), prot, ret);
+            }
             self.map(VirtAddr::new(vaddr), paddr, area.flags);
             vaddr += PAGE_SIZE;
         }

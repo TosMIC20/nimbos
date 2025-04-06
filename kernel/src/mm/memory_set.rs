@@ -168,6 +168,20 @@ impl MemorySet {
         }
     }
 
+    pub fn insert_sync(&mut self, area: MapArea) {
+        if area.size > 0 {
+            // TODO: check overlap
+            if let Entry::Vacant(e) = self.areas.entry(area.start) {
+                self.pt.map_area_sync(e.insert(area));
+            } else {
+                panic!(
+                    "MemorySet::insert: MepArea starts from {:#x?} is existed!",
+                    area.start
+                );
+            }
+        }
+    }
+
     pub fn load_user(&mut self, elf_data: &[u8]) -> (VirtAddr, VirtAddr) {
         use xmas_elf::program::{Flags, SegmentData, Type};
         use xmas_elf::{header, ElfFile};
@@ -226,11 +240,16 @@ impl MemorySet {
                 ph.flags().into(),
             );
             area.write_data(offset, data);
-            self.insert(area);
+            if ph.flags().is_execute() {
+                // no need to sync code area with shadow
+                self.insert(area);
+            } else {
+                self.insert_sync(area);
+            }
             instructions::flush_icache_all();
         }
         // user stack
-        self.insert(MapArea::new_framed(
+        self.insert_sync(MapArea::new_framed(
             VirtAddr::new(USER_STACK_BASE),
             USER_STACK_SIZE,
             MemFlags::READ | MemFlags::WRITE | MemFlags::USER,

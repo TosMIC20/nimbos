@@ -84,7 +84,7 @@ impl SyscallQueueBuffer {
         ret
     }
 
-    fn pop_response(&mut self) -> Option<ScfResponse> {
+    pub fn pop_response(&mut self) -> Option<ScfResponse> {
         let flag = spin_lock_irqsave(&self.meta.lock);
         let ret = self.pop_response_locked();
         spin_unlock_irqrestore(&self.meta.lock, flag);
