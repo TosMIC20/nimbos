@@ -56,6 +56,14 @@ struct ReadWriteArgs {
     len: u64,
 }
 
+#[repr(C)]
+#[derive(Debug)]
+struct ReadWriteArgsNew {
+    fd: u32,
+    buf: u64,
+    len: u64,
+}
+
 fn send_request(opcode: ScfOpcode, args: u64, token: ScfRequestToken) {
     while !SyscallQueueBuffer::get().send(opcode, args, token) {
         CurrentTask::get().yield_now();
@@ -73,11 +81,11 @@ fn send_request_kernel(opcode: ScfOpcode, args: u64, token: ScfRequestToken) {
 pub fn sys_write(fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
     assert!(len < CHUNK_SIZE);
     let pool = SyscallDataBuffer::get();
-    let chunk_ptr = unsafe { pool.alloc_array_uninit::<u8>(len) };
-    buf.read_buf(unsafe { from_raw_parts_mut(chunk_ptr as _, len) });
-    let args = pool.alloc(ReadWriteArgs {
+    // let chunk_ptr = unsafe { pool.alloc_array_uninit::<u8>(len) };
+    // buf.read_buf(unsafe { from_raw_parts_mut(chunk_ptr as _, len) });
+    let args = pool.alloc(ReadWriteArgsNew {
         fd: fd as _,
-        buf_offset: pool.offset_of(chunk_ptr),
+        buf: buf.as_ptr() as _,
         len: len as _,
     });
     let cond = SyscallCondVar::new();
@@ -88,7 +96,7 @@ pub fn sys_write(fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
     );
     let ret = cond.wait();
     unsafe {
-        pool.dealloc(chunk_ptr);
+        // pool.dealloc(chunk_ptr);
         pool.dealloc(args);
     }
     ret as _
@@ -97,10 +105,10 @@ pub fn sys_write(fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
 pub fn sys_read(fd: usize, mut buf: UserOutPtr<u8>, len: usize) -> isize {
     assert!(len < CHUNK_SIZE);
     let pool = SyscallDataBuffer::get();
-    let chunk_ptr = unsafe { pool.alloc_array_uninit::<u8>(len) };
-    let args = pool.alloc(ReadWriteArgs {
+    // let chunk_ptr = unsafe { pool.alloc_array_uninit::<u8>(len) };
+    let args = pool.alloc(ReadWriteArgsNew {
         fd: fd as _,
-        buf_offset: pool.offset_of(chunk_ptr),
+        buf: buf.as_mut_ptr() as _,
         len: len as _,
     });
     let cond = SyscallCondVar::new();
@@ -111,8 +119,8 @@ pub fn sys_read(fd: usize, mut buf: UserOutPtr<u8>, len: usize) -> isize {
     );
     let ret = cond.wait();
     unsafe {
-        buf.write_buf(from_raw_parts(chunk_ptr as _, len));
-        pool.dealloc(chunk_ptr);
+        // buf.write_buf(from_raw_parts(chunk_ptr as _, len));
+        // pool.dealloc(chunk_ptr);
         pool.dealloc(args);
     }
     ret as _
