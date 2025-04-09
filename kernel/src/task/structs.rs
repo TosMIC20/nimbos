@@ -4,9 +4,10 @@ use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 use super::manager::{TaskLockedCell, TASK_MANAGER};
 use crate::arch::{instructions, TaskContext, TrapFrame};
+use crate::scf::SCF;
 use crate::config::KERNEL_STACK_SIZE;
 use crate::loader;
-use crate::mm::{kernel_aspace, MemorySet, VirtAddr};
+use crate::mm::{kernel_aspace, MemorySet, VirtAddr, UserInPtr, UserOutPtr};
 use crate::percpu::PerCpu;
 use crate::sync::{LazyInit, Mutex};
 
@@ -40,6 +41,7 @@ pub struct Task {
     kstack: Stack<KERNEL_STACK_SIZE>,
     ctx: TaskLockedCell<TaskContext>,
 
+    scf: Option<Mutex<SCF>>,
     vm: Option<Arc<Mutex<MemorySet>>>,
     pub(super) parent: Mutex<Weak<Task>>,
     pub(super) children: Mutex<Vec<Arc<Task>>>,
@@ -84,6 +86,7 @@ impl Task {
             state: AtomicU8::new(TaskState::Ready as u8),
             entry: EntryState::Kernel { pc: 0, arg: 0 },
             exit_code: AtomicI32::new(0),
+            scf: None,
 
             kstack: Stack::default(),
             ctx: TaskLockedCell::new(TaskContext::default()),
@@ -128,11 +131,16 @@ impl Task {
     }
 
     pub fn new_user(path: &str) -> Arc<Self> {
+        let mut t = Self::new_common(TaskId::alloc());
+        // Must set SCF before setting memory set
+        t.scf = Some(Mutex::new(SCF::new(0)));
+        let mut scf = t.scf.as_mut().unwrap().lock();
+
         let elf_data = loader::get_app_data_by_name(path).expect("new_user: no such app");
         let mut vm = MemorySet::new();
-        let (entry, ustack_top) = vm.load_user(elf_data);
+        let (entry, ustack_top) = vm.load_user(elf_data, &mut Some(&mut *scf));
+        drop(scf);
 
-        let mut t = Self::new_common(TaskId::alloc());
         t.entry = EntryState::User(Box::new(TrapFrame::new_user(entry, ustack_top, 0)));
         t.ctx
             .get_mut()
@@ -163,10 +171,12 @@ impl Task {
         t
     }
 
-    pub fn new_fork(self: &Arc<Self>, tf: &TrapFrame) -> Arc<Self> {
+    pub fn new_fork(self: &Arc<Self>, tf: &TrapFrame, slot_num: usize) -> Arc<Self> {
         assert!(!self.is_kernel_task());
         let mut t = Self::new_common(TaskId::alloc());
-        let vm = self.vm.as_ref().unwrap().lock().dup();
+        let mut scf_instance =SCF::new(slot_num);
+        let vm = self.vm.as_ref().unwrap().lock().dup(&mut Some(&mut scf_instance));
+        t.scf = Some(Mutex::new(scf_instance));
         t.entry = EntryState::User(Box::new(tf.new_fork()));
         t.ctx
             .get_mut()
@@ -177,7 +187,6 @@ impl Task {
         self.add_child(&t);
         t
     }
-
     pub const fn pid(&self) -> TaskId {
         self.id
     }
@@ -258,7 +267,8 @@ impl<'a> CurrentTask<'a> {
         info!("task exit with code {}", exit_code);
         if let Some(vm) = self.vm.as_ref() {
             if Arc::strong_count(vm) == 1 {
-                vm.lock().clear(); // drop memory set before lock
+                let mut scf_mut = self.scf.as_ref().unwrap().lock();
+                vm.lock().clear(&mut Some(&mut *scf_mut)); // drop memory set before lock
             }
         }
         TASK_MANAGER.lock().exit_current(self, exit_code)
@@ -269,8 +279,9 @@ impl<'a> CurrentTask<'a> {
         assert_eq!(Arc::strong_count(self.vm.as_ref().unwrap()), 1);
         if let Some(elf_data) = loader::get_app_data_by_name(path) {
             let mut vm = self.vm.as_ref().unwrap().lock();
-            vm.clear();
-            let (entry, ustack_top) = vm.load_user(elf_data);
+            let mut scf = self.scf.as_ref().unwrap().lock();
+            vm.clear(&mut Some(&mut *scf));
+            let (entry, ustack_top) = vm.load_user(elf_data, &mut Some(&mut *scf));
             *tf = TrapFrame::new_user(entry, ustack_top, 0);
             instructions::flush_tlb_all();
             0
@@ -278,6 +289,20 @@ impl<'a> CurrentTask<'a> {
             -1
         }
     }
+
+    
+    pub fn scf_read(&self, fd: usize, buf: UserOutPtr<u8>, len: usize) -> isize {
+        self.scf.as_ref().unwrap().lock().read(fd, buf, len)
+    }
+
+    pub fn scf_write(&self, fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
+        self.scf.as_ref().unwrap().lock().write(fd, buf, len)
+    }
+
+    pub fn scf_syncfork(&self) -> isize {
+        self.scf.as_ref().unwrap().lock().syncfork()
+    }
+
 
     pub fn waitpid(&self, pid: isize, exit_code: &mut i32) -> isize {
         let mut children = self.children.lock();

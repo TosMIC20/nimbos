@@ -22,17 +22,17 @@ pub const TICKS_PER_SEC: u64 = 100;
 cfg_if! {
     if #[cfg(feature = "rvm")] {
         pub const PHYS_MEMORY_END: usize = PHYS_MEMORY_BASE + PHYS_MEMORY_SIZE
-            - scf::SYSCALL_DATA_BUF_SIZE
-            - scf::SYSCALL_QUEUE_BUF_SIZE;
+            - scf::SYSCALL_QUEUE_BUF_SIZE * scf::SYSCALL_MAX_SLOT_NUM;
 
         pub mod scf {
             pub const SYSCALL_IPI_IRQ_NUM: usize = 13;
 
-            pub const SYSCALL_DATA_BUF_SIZE: usize = 0x10_0000; // 1M
+            // pub const SYSCALL_DATA_BUF_SIZE: usize = 0x10_0000; // 1M
             pub const SYSCALL_QUEUE_BUF_SIZE: usize = 4096; // 4K
+            pub const SYSCALL_MAX_SLOT_NUM: usize = 16;
 
-            pub const SYSCALL_DATA_BUF_PADDR: usize = super::PHYS_MEMORY_END;
-            pub const SYSCALL_QUEUE_BUF_PADDR: usize = SYSCALL_DATA_BUF_PADDR + SYSCALL_DATA_BUF_SIZE;
+            // pub const SYSCALL_DATA_BUF_PADDR: usize = super::PHYS_MEMORY_END;
+            pub const SYSCALL_QUEUE_BUF_BASE_PADDR: usize = super::PHYS_MEMORY_END;
         }
     } else {
         pub const PHYS_MEMORY_END: usize = PHYS_MEMORY_BASE + PHYS_MEMORY_SIZE;

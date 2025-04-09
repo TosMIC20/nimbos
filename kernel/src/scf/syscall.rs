@@ -1,8 +1,7 @@
-use core::slice::{from_raw_parts, from_raw_parts_mut};
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::allocator::SyscallDataBuffer;
-use super::queue::{ScfRequestToken, SyscallQueueBuffer};
+use super::queue::ScfRequestToken;
+use super::SCF;
 use crate::mm::{UserInPtr, UserOutPtr};
 use crate::task::CurrentTask;
 
@@ -16,6 +15,8 @@ numeric_enum_macro::numeric_enum! {
         Open = 3,
         Close = 4,
         SyncMap = 5,
+        SyncUnmap = 6,
+        SyncFork = 7,
         Unknown = 0xff,
     }
 }
@@ -48,117 +49,112 @@ impl SyscallCondVar {
     }
 }
 
-#[repr(C)]
-#[derive(Debug)]
-struct ReadWriteArgs {
-    fd: u32,
-    buf_offset: u64,
-    len: u64,
-}
-
-#[repr(C)]
-#[derive(Debug)]
-struct ReadWriteArgsNew {
-    fd: u32,
-    buf: u64,
-    len: u64,
-}
-
-fn send_request(opcode: ScfOpcode, args: u64, token: ScfRequestToken) {
-    while !SyscallQueueBuffer::get().send(opcode, args, token) {
-        CurrentTask::get().yield_now();
+impl SCF {
+    fn send_request(&mut self, opcode: ScfOpcode, args: [u64; 4], token: ScfRequestToken, irq_num: usize) {
+        while !self.queue().send(opcode, args, token) {
+            CurrentTask::get().yield_now();
+        }
+        super::notify(irq_num);
     }
-    super::notify();
-}
 
-fn send_request_kernel(opcode: ScfOpcode, args: u64, token: ScfRequestToken) {
-    while !SyscallQueueBuffer::get().send(opcode, args, token) {
-        core::hint::spin_loop();
+    fn send_request_kernel(&mut self, opcode: ScfOpcode, args: [u64; 4], token: ScfRequestToken, irq_num: usize) {
+        while !self.queue().send(opcode, args, token) {
+            core::hint::spin_loop();
+        }
+        super::notify(irq_num);
     }
-    super::notify();
-}
 
-pub fn sys_write(fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
-    assert!(len < CHUNK_SIZE);
-    let pool = SyscallDataBuffer::get();
-    // let chunk_ptr = unsafe { pool.alloc_array_uninit::<u8>(len) };
-    // buf.read_buf(unsafe { from_raw_parts_mut(chunk_ptr as _, len) });
-    let args = pool.alloc(ReadWriteArgsNew {
-        fd: fd as _,
-        buf: buf.as_ptr() as _,
-        len: len as _,
-    });
-    let cond = SyscallCondVar::new();
-    send_request(
-        ScfOpcode::Write,
-        pool.offset_of(args),
-        ScfRequestToken::from(&cond),
-    );
-    let ret = cond.wait();
-    unsafe {
-        // pool.dealloc(chunk_ptr);
-        pool.dealloc(args);
+    pub fn write(&mut self, fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
+        debug!("sys_write: fd={}, buf={:#x}, len={}, slot={}", fd, buf.as_ptr() as usize, len, self.slot_num);
+        assert!(len < CHUNK_SIZE);
+        let cond = SyscallCondVar::new();
+        self.send_request(
+            ScfOpcode::Write,
+            [fd as _, buf.as_ptr() as _, len as _, 0],
+            ScfRequestToken::from(&cond),
+            self.irq_num(),
+        );
+        let ret = cond.wait();
+        ret as _
     }
-    ret as _
-}
 
-pub fn sys_read(fd: usize, mut buf: UserOutPtr<u8>, len: usize) -> isize {
-    assert!(len < CHUNK_SIZE);
-    let pool = SyscallDataBuffer::get();
-    // let chunk_ptr = unsafe { pool.alloc_array_uninit::<u8>(len) };
-    let args = pool.alloc(ReadWriteArgsNew {
-        fd: fd as _,
-        buf: buf.as_mut_ptr() as _,
-        len: len as _,
-    });
-    let cond = SyscallCondVar::new();
-    send_request(
-        ScfOpcode::Read,
-        pool.offset_of(args),
-        ScfRequestToken::from(&cond),
-    );
-    let ret = cond.wait();
-    unsafe {
-        // buf.write_buf(from_raw_parts(chunk_ptr as _, len));
-        // pool.dealloc(chunk_ptr);
-        pool.dealloc(args);
+    pub fn read(&mut self, fd: usize, mut buf: UserOutPtr<u8>, len: usize) -> isize {
+        debug!("sys_read: fd={}, buf={:#x}, len={}, slot={}", fd, buf.as_ptr() as usize, len, self.slot_num);
+        assert!(len < CHUNK_SIZE);
+        let cond = SyscallCondVar::new();
+        self.send_request(
+            ScfOpcode::Read,
+            [fd as _, buf.as_mut_ptr() as _, len as _, 0],
+            ScfRequestToken::from(&cond),
+            self.irq_num(),
+        );
+        let ret = cond.wait();
+        ret as _
     }
-    ret as _
-}
 
-#[repr(C)]
-#[derive(Debug)]
-pub struct SyncMapArgs {
-    vaddr: u64,
-    len: u64,
-    paddr: u64,
-    prot: i32,
-}
+    pub fn syncmap(&mut self, vaddr: usize, len: usize, paddr: usize, prot: usize) -> isize {
+        debug!("sys_syncmap: vaddr={:#x}, len={:#x}, paddr={:#x}, prot={:#x}, slot={}", vaddr, len, paddr, prot, self.slot_num);
+        let cond = SyscallCondVar::new();
+        self.send_request_kernel(
+            ScfOpcode::SyncMap,
+            [vaddr as _, len as _, paddr as _, prot as _],
+            ScfRequestToken::from(&cond),
+            self.irq_num()
+        );
 
-pub fn sys_syncmap(vaddr: usize, len: usize, paddr: usize, prot: usize) -> isize {
-    debug!("sys_syncmap: vaddr={:#x}, len={:#x}, paddr={:#x}, prot={:#x}", vaddr, len, paddr, prot);
-    let pool = SyscallDataBuffer::get();
-    let args = pool.alloc(SyncMapArgs {
-        vaddr: vaddr as _,
-        len: len as _,
-        paddr: paddr as _,
-        prot: prot as _,
-    });
-    let cond = SyscallCondVar::new();
-    send_request_kernel(
-        ScfOpcode::SyncMap,
-        pool.offset_of(args),
-        ScfRequestToken::from(&cond),
-    );
+        // Better waiting strategy?
+        loop {
+            let response = self.queue().pop_response();
+            if response.is_some() {
+                let scf_response = response.unwrap();
+                let ret = scf_response.ret_val;
+                debug!("sys_syncmap: response received: ret={:#x}", ret);
+                return ret as _;
+            }
+        }
+    }
 
-    // Better waiting strategy?
-    loop {
-        let response = SyscallQueueBuffer::get().pop_response();
-        if response.is_some() {
-            let scf_response = response.unwrap();
-            let ret = scf_response.ret_val;
-            debug!("sys_syncmap: response received: ret={:#x}", ret);
-            return ret as _;
+    pub fn syncunmap(&mut self, vaddr: usize, len: usize) -> isize {
+        debug!("sys_syncunmap: vaddr={:#x}, len={:#x}, slot={}", vaddr, len, self.slot_num);
+        let cond = SyscallCondVar::new();
+        self.send_request_kernel(
+            ScfOpcode::SyncUnmap,
+            [vaddr as _, len as _, 0, 0],
+            ScfRequestToken::from(&cond),
+            self.irq_num()
+        );
+
+        // Better waiting strategy?
+        loop {
+            let response = self.queue().pop_response();
+            if response.is_some() {
+                let scf_response = response.unwrap();
+                let ret = scf_response.ret_val;
+                debug!("sys_syncunmap: response received: ret={:#x}", ret);
+                return ret as _;
+            }
+        }
+    }
+
+    pub fn syncfork(&mut self) -> isize {
+        debug!("sys_syncfork: slot={}", self.slot_num);
+        let cond = SyscallCondVar::new();
+        self.send_request(
+            ScfOpcode::SyncFork,
+            [0; 4],
+            ScfRequestToken::from(&cond),
+            self.irq_num()
+        );
+
+        // Better waiting strategy?
+        loop {
+            let response = self.queue().pop_response();
+            if response.is_some() {
+                let scf_response = response.unwrap();
+                let ret = scf_response.ret_val;
+                debug!("sys_syncfork: response received: ret={}", ret);
+                return ret as _;
+            }
         }
     }
 }

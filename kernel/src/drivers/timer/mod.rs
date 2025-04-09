@@ -12,7 +12,8 @@ cfg_if! {
     }
 }
 
-pub use self::imp::{get_time_ns, init};
+
+pub use self::imp::get_time_ns;
 
 use crate::sync::SpinNoIrqLock;
 use alloc::vec::Vec;
@@ -30,4 +31,8 @@ pub fn timer_tick() {
 
 pub fn add_timer_event(callback: TimerCallback) {
     TIMER_EVENTS.lock().push(callback);
+}
+
+pub fn init() {
+    imp::init();
 }

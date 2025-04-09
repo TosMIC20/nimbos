@@ -4,7 +4,7 @@ use core::mem::{align_of, size_of};
 use core::sync::atomic::{fence, AtomicBool, Ordering};
 
 use super::syscall::SyscallCondVar;
-use super::ScfOpcode;
+use super::syscall::ScfOpcode;
 use crate::config::scf::*;
 use crate::mm::{PhysAddr, VirtAddr};
 use crate::sync::LazyInit;
@@ -12,7 +12,10 @@ use crate::sync::{spin_lock_irqsave, spin_unlock_irqrestore};
 
 const SYSCALL_QUEUE_BUFFER_MAGIC: u32 = 0x4643537f; // "\x7fSCF"
 
-static mut QUEUE_BUFFER: LazyInit<SyscallQueueBuffer> = LazyInit::new();
+static mut QUEUE_ARRAY: [LazyInit<SyscallQueueBuffer>; SYSCALL_MAX_SLOT_NUM] = [LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new(), 
+LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new(), 
+LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new(), 
+LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new()];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScfRequestToken(u64);
@@ -32,7 +35,7 @@ struct SyscallQueueBufferMetadata {
 struct ScfDescriptor {
     valid: bool,
     opcode: u8,
-    args: u64,
+    args: [u64; 4],
     ret_val: u64,
 }
 
@@ -73,11 +76,7 @@ impl ScfRequestToken {
 }
 
 impl SyscallQueueBuffer {
-    pub fn get() -> &'static mut Self {
-        unsafe { &mut QUEUE_BUFFER }
-    }
-
-    pub fn send(&mut self, opcode: ScfOpcode, args: u64, token: ScfRequestToken) -> bool {
+    pub fn send(&mut self, opcode: ScfOpcode, args: [u64; 4], token: ScfRequestToken) -> bool {
         let flag = spin_lock_irqsave(&self.meta.lock);
         let ret = self.send_locked(opcode, args, token);
         spin_unlock_irqrestore(&self.meta.lock, flag);
@@ -93,7 +92,7 @@ impl SyscallQueueBuffer {
 }
 
 impl SyscallQueueBuffer {
-    fn new(base_vaddr: VirtAddr, buf_size: usize) -> Self {
+    pub fn new(base_vaddr: VirtAddr, buf_size: usize) -> Self {
         let meta_size = align_up(
             size_of::<SyscallQueueBufferMetadata>(),
             align_of::<ScfDescriptor>(),
@@ -139,6 +138,14 @@ impl SyscallQueueBuffer {
             req_ring,
             rsp_ring,
         }
+    }
+
+    pub fn reset(&mut self) {
+        self.meta.req_index = 0;
+        self.meta.rsp_index = 0;
+        self.req_index_shadow = 0;
+        self.rsp_index_last = 0;
+        self.free_count = self.meta.capacity;
     }
 
     fn is_full(&self) -> bool {
@@ -196,7 +203,7 @@ impl SyscallQueueBuffer {
         }
     }
 
-    fn send_locked(&mut self, opcode: ScfOpcode, args: u64, token: ScfRequestToken) -> bool {
+    fn send_locked(&mut self, opcode: ScfOpcode, args: [u64; 4], token: ScfRequestToken) -> bool {
         if self.is_full() {
             return false;
         }
@@ -235,18 +242,20 @@ const fn align_up(addr: usize, alignment: usize) -> usize {
     (addr + alignment - 1) & !(alignment - 1)
 }
 
-fn handle_irq() {
-    while let Some(rsp) = SyscallQueueBuffer::get().pop_response() {
-        if rsp.token.is_valid() {
-            rsp.token.as_cond_var().signal(rsp.ret_val);
+pub fn init_all_queues() {
+    unsafe {
+        for slot_num in 0..SYSCALL_MAX_SLOT_NUM {
+            QUEUE_ARRAY[slot_num].init_by({
+                let paddr = SYSCALL_QUEUE_BUF_BASE_PADDR + slot_num * SYSCALL_QUEUE_BUF_SIZE;
+                SyscallQueueBuffer::new(
+                    PhysAddr::new(paddr).into_kvaddr(),
+                    SYSCALL_QUEUE_BUF_SIZE,
+                )
+            });
         }
     }
 }
 
-pub fn init() {
-    unsafe { &QUEUE_BUFFER }.init_by(SyscallQueueBuffer::new(
-        PhysAddr::new(SYSCALL_QUEUE_BUF_PADDR).into_kvaddr(),
-        SYSCALL_QUEUE_BUF_SIZE,
-    ));
-    crate::drivers::timer::add_timer_event(handle_irq);
+pub fn get_queue(slot_num: usize) -> &'static mut SyscallQueueBuffer {
+    unsafe { &mut QUEUE_ARRAY[slot_num] }
 }

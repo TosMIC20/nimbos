@@ -7,6 +7,7 @@ use crate::arch::{instructions, PageTable};
 use crate::config::{KERNEL_ASPACE_BASE, KERNEL_ASPACE_SIZE, USER_STACK_BASE, USER_STACK_SIZE};
 use crate::config::{MMIO_REGIONS, PHYS_MEMORY_END};
 use crate::mm::{PhysAddr, VirtAddr};
+use crate::scf::SCF;
 use crate::sync::LazyInit;
 
 extern "C" {
@@ -154,11 +155,11 @@ impl MemorySet {
         }
     }
 
-    pub fn insert(&mut self, area: MapArea) {
+    pub fn insert(&mut self, area: MapArea, scf: &mut Option<&mut SCF>) {
         if area.size > 0 {
             // TODO: check overlap
             if let Entry::Vacant(e) = self.areas.entry(area.start) {
-                self.pt.map_area(e.insert(area));
+                self.pt.map_area(e.insert(area), scf);
             } else {
                 panic!(
                     "MemorySet::insert: MepArea starts from {:#x?} is existed!",
@@ -168,7 +169,7 @@ impl MemorySet {
         }
     }
 
-    pub fn load_user(&mut self, elf_data: &[u8]) -> (VirtAddr, VirtAddr) {
+    pub fn load_user(&mut self, elf_data: &[u8], scf: &mut Option<&mut SCF>) -> (VirtAddr, VirtAddr) {
         use xmas_elf::program::{Flags, SegmentData, Type};
         use xmas_elf::{header, ElfFile};
 
@@ -231,7 +232,7 @@ impl MemorySet {
                 flags,
             );
             area.write_data(offset, data);
-            self.insert(area);
+            self.insert(area, scf);
             instructions::flush_icache_all();
         }
         // user stack
@@ -239,24 +240,24 @@ impl MemorySet {
             VirtAddr::new(USER_STACK_BASE),
             USER_STACK_SIZE,
             MemFlags::READ | MemFlags::WRITE | MemFlags::USER | MemFlags::SYNC,
-        ));
+        ), scf);
 
         let entry = VirtAddr::new(elf.header.pt2.entry_point() as usize);
         let ustack_top = VirtAddr::new(USER_STACK_BASE + USER_STACK_SIZE);
         (entry, ustack_top)
     }
 
-    pub fn clear(&mut self) {
+    pub fn clear(&mut self, scf: &mut Option<&mut SCF>) {
         for area in self.areas.values_mut() {
-            self.pt.unmap_area(area);
+            self.pt.unmap_area(area, scf);
         }
         self.areas.clear();
     }
 
-    pub fn dup(&self) -> Self {
+    pub fn dup(&self, scf: &mut Option<&mut SCF>) -> Self {
         let mut ms = Self::new();
         for area in self.areas.values() {
-            ms.insert(area.dup());
+            ms.insert(area.dup(), scf);
         }
         ms
     }
@@ -268,7 +269,7 @@ impl MemorySet {
 
 impl Drop for MemorySet {
     fn drop(&mut self) {
-        self.clear();
+        self.clear(&mut None);
     }
 }
 
@@ -288,7 +289,7 @@ pub fn init_kernel_aspace() {
             PhysAddr::new(virt_to_phys(start)),
             end - start,
             flags,
-        ));
+        ), &mut None);
     };
 
     // map kernel sections
@@ -331,15 +332,15 @@ pub fn init_kernel_aspace() {
     #[cfg(feature = "rvm")]
     {
         use crate::config::scf::*;
+        // map_range(
+        //     phys_to_virt(SYSCALL_DATA_BUF_PADDR),
+        //     phys_to_virt(SYSCALL_DATA_BUF_PADDR + SYSCALL_DATA_BUF_SIZE),
+        //     MemFlags::READ | MemFlags::WRITE,
+        //     "syscall data buffer",
+        // );
         map_range(
-            phys_to_virt(SYSCALL_DATA_BUF_PADDR),
-            phys_to_virt(SYSCALL_DATA_BUF_PADDR + SYSCALL_DATA_BUF_SIZE),
-            MemFlags::READ | MemFlags::WRITE,
-            "syscall data buffer",
-        );
-        map_range(
-            phys_to_virt(SYSCALL_QUEUE_BUF_PADDR),
-            phys_to_virt(SYSCALL_QUEUE_BUF_PADDR + SYSCALL_QUEUE_BUF_SIZE),
+            phys_to_virt(SYSCALL_QUEUE_BUF_BASE_PADDR),
+            phys_to_virt(SYSCALL_QUEUE_BUF_BASE_PADDR + SYSCALL_QUEUE_BUF_SIZE * SYSCALL_MAX_SLOT_NUM),
             MemFlags::READ | MemFlags::WRITE,
             "syscall queue buffer",
         );
