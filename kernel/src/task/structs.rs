@@ -1,5 +1,7 @@
 use alloc::sync::{Arc, Weak};
 use alloc::{boxed::Box, vec::Vec};
+use core::alloc::Layout;
+use core::slice::from_raw_parts;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 use super::manager::{TaskLockedCell, TASK_MANAGER};
@@ -195,6 +197,10 @@ impl Task {
         self.is_kernel
     }
 
+    pub const fn is_scf_task(&self) -> bool {
+        self.scf.is_some()
+    }
+
     pub const fn is_root(&self) -> bool {
         self.id.as_usize() == 1
     }
@@ -267,8 +273,7 @@ impl<'a> CurrentTask<'a> {
         info!("task exit with code {}", exit_code);
         if let Some(vm) = self.vm.as_ref() {
             if Arc::strong_count(vm) == 1 {
-                let mut scf_mut = self.scf.as_ref().unwrap().lock();
-                vm.lock().clear(&mut Some(&mut *scf_mut)); // drop memory set before lock
+                vm.lock().clear(&mut None); // drop memory set before lock
             }
         }
         TASK_MANAGER.lock().exit_current(self, exit_code)
@@ -290,20 +295,6 @@ impl<'a> CurrentTask<'a> {
         }
     }
 
-    
-    pub fn scf_read(&self, fd: usize, buf: UserOutPtr<u8>, len: usize) -> isize {
-        self.scf.as_ref().unwrap().lock().read(fd, buf, len)
-    }
-
-    pub fn scf_write(&self, fd: usize, buf: UserInPtr<u8>, len: usize) -> isize {
-        self.scf.as_ref().unwrap().lock().write(fd, buf, len)
-    }
-
-    pub fn scf_syncfork(&self) -> isize {
-        self.scf.as_ref().unwrap().lock().syncfork()
-    }
-
-
     pub fn waitpid(&self, pid: isize, exit_code: &mut i32) -> isize {
         let mut children = self.children.lock();
         let mut found_pid = false;
@@ -323,6 +314,51 @@ impl<'a> CurrentTask<'a> {
         } else {
             -1
         }
+    }
+
+    pub fn exec_data(&self, elf_data: &[u8], tf: &mut TrapFrame) {
+        let mut vm = self.vm.as_ref().unwrap().lock();
+        let mut scf = self.scf.as_ref().unwrap().lock();
+        vm.clear(&mut Some(&mut *scf));
+        let (entry, ustack_top) = vm.load_user(elf_data, &mut Some(&mut *scf));
+        *tf = TrapFrame::new_user(entry, ustack_top, 0);
+        instructions::flush_tlb_all();
+    }
+
+    pub fn scf_read(&self, fd: isize, buf: *mut u8, len: usize) -> isize {
+        self.scf.as_ref().unwrap().lock().read(fd, buf, len)
+    }
+
+    pub fn scf_write(&self, fd: isize, buf: *const u8, len: usize) -> isize {
+        self.scf.as_ref().unwrap().lock().write(fd, buf, len)
+    }
+
+    pub fn scf_open(&self, path: *const u8, flags: usize, mode: usize) -> isize {
+        self.scf.as_ref().unwrap().lock().open(path, flags, mode)
+    }
+
+    pub fn scf_close(&self, fd: usize) -> isize {
+        self.scf.as_ref().unwrap().lock().close(fd)
+    }
+
+    pub fn scf_syncfork(&self) -> isize {
+        self.scf.as_ref().unwrap().lock().syncfork()
+    }
+
+    pub fn scf_stat(&self, path: *const u8) -> isize {
+        self.scf.as_ref().unwrap().lock().stat(path)
+    }
+
+    pub fn scf_exec(&self, path: *const u8) -> Option<Vec<u8>> {
+        self.scf.as_ref().unwrap().lock().exec(path)
+    }
+
+    pub fn scf_clone(&self) -> isize {
+        self.scf.as_ref().unwrap().lock().clone()
+    }
+
+    pub fn scf_exit(&self) -> isize {
+        self.scf.as_ref().unwrap().lock().exit()
     }
 }
 

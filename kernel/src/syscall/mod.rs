@@ -18,6 +18,9 @@ mod time;
 #[cfg(feature = "rvm")]
 use crate::task::CurrentTask;
 
+#[cfg(feature = "rvm")]
+use crate::scf::syscall::*;
+
 #[cfg(not(feature = "rvm"))]
 use self::fs::*;
 
@@ -38,8 +41,8 @@ pub fn syscall(
         syscall_id, arg0, arg1, arg2
     );
     let ret = match syscall_id {
-        SYSCALL_READ => CurrentTask::get().scf_read(arg0, arg1.into(), arg2),
-        SYSCALL_WRITE => CurrentTask::get().scf_write(arg0, arg1.into(), arg2),
+        SYSCALL_READ => sys_read(arg0 as _, arg1.into(), arg2),
+        SYSCALL_WRITE => sys_write(arg0 as _, arg1.into(), arg2),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_NANOSLEEP => sys_nanosleep(arg0.into()),
         SYSCALL_GETPID => sys_getpid(),

@@ -12,10 +12,9 @@ use crate::sync::{spin_lock_irqsave, spin_unlock_irqrestore};
 
 const SYSCALL_QUEUE_BUFFER_MAGIC: u32 = 0x4643537f; // "\x7fSCF"
 
-static mut QUEUE_ARRAY: [LazyInit<SyscallQueueBuffer>; SYSCALL_MAX_SLOT_NUM] = [LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new(), 
-LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new(), 
-LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new(), 
-LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new()];
+static mut QUEUE_ARRAY: [LazyInit<SyscallQueueBuffer>; SYSCALL_MAX_SLOT_NUM] = [
+    LazyInit::new(), LazyInit::new(), LazyInit::new(), LazyInit::new()
+];
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScfRequestToken(u64);
@@ -141,11 +140,16 @@ impl SyscallQueueBuffer {
     }
 
     pub fn reset(&mut self) {
+        let flag = spin_lock_irqsave(&self.meta.lock);
+        fence(Ordering::SeqCst);
         self.meta.req_index = 0;
         self.meta.rsp_index = 0;
-        self.req_index_shadow = 0;
         self.rsp_index_last = 0;
         self.free_count = self.meta.capacity;
+        self.req_index_shadow = 0;
+        self.desc.iter_mut().for_each(|d| d.valid = false);
+        self.tokens.iter_mut().for_each(|t| *t = ScfRequestToken::default());
+        spin_unlock_irqrestore(&self.meta.lock, flag);
     }
 
     fn is_full(&self) -> bool {

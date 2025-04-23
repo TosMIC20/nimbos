@@ -1,3 +1,5 @@
+use core::slice::from_raw_parts;
+
 use super::time::TimeSpec;
 use crate::arch::TrapFrame;
 use crate::mm::{UserInPtr, UserOutPtr};
@@ -6,6 +8,7 @@ use crate::task::{spawn_task, CurrentTask};
 const MAX_STR_LEN: usize = 256;
 
 pub fn sys_exit(exit_code: i32) -> ! {
+    CurrentTask::get().scf_exit();
     CurrentTask::get().exit(exit_code);
 }
 
@@ -21,6 +24,7 @@ pub fn sys_getpid() -> isize {
 pub fn sys_clone(newsp: usize, tf: &TrapFrame) -> isize {
     let new_task = CurrentTask::get().new_clone(newsp, tf);
     let pid = new_task.pid().as_usize() as isize;
+    CurrentTask::get().scf_clone();
     spawn_task(new_task);
     pid
 }
@@ -36,8 +40,18 @@ pub fn sys_fork(tf: &TrapFrame) -> isize {
 
 pub fn sys_exec(path: UserInPtr<u8>, tf: &mut TrapFrame) -> isize {
     let (path_buf, len) = path.read_str::<MAX_STR_LEN>();
-    let path = core::str::from_utf8(&path_buf[..len]).unwrap();
-    CurrentTask::get().exec(path, tf)
+    let path_str = core::str::from_utf8(&path_buf[..len]).unwrap();
+    let ret = CurrentTask::get().exec(path_str, tf);
+    if ret < 0 {
+        if let Some(data) = CurrentTask::get().scf_exec(path.as_ptr()) {
+            CurrentTask::get().exec_data(&data[..], tf);
+            0
+        } else {
+            -1
+        }
+    } else {
+        ret
+    }
 }
 
 /// If there is no child process has the same pid as the given, return -1.
