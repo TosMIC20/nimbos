@@ -1,15 +1,11 @@
-use core::slice::from_raw_parts;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use alloc::vec::Vec;
 
 use super::queue::ScfRequestToken;
 use super::SCF;
 use crate::config::KERNEL_HEAP_SIZE;
-use crate::mm::{UserInPtr, UserOutPtr};
 use crate::scf::queue::get_queue;
 use crate::task::CurrentTask;
-
-const MAX_STR_LEN: usize = 256;
 
 numeric_enum_macro::numeric_enum! {
     #[repr(u8)]
@@ -56,14 +52,6 @@ impl SyscallCondVar {
         }
         self.ret_val.load(Ordering::Acquire)
     }
-}
-
-pub fn sys_read(fd: isize, mut buf: UserOutPtr<u8>, len: usize) -> isize {
-    CurrentTask::get().scf_read(fd, buf.as_mut_ptr(), len)
-}
-
-pub fn sys_write(fd: isize, buf: UserInPtr<u8>, len: usize) -> isize {
-    CurrentTask::get().scf_write(fd, buf.as_ptr(), len)
 }
 
 impl SCF {
@@ -123,7 +111,7 @@ impl SCF {
         ret as _
     }
 
-    pub fn close(&mut self, fd: usize) -> isize {
+    pub fn close(&mut self, fd: isize) -> isize {
         debug!("sys_close: fd={}, slot={}", fd, self.slot_num);
         let cond = SyscallCondVar::new();
         self.send_request(
@@ -216,7 +204,7 @@ impl SCF {
 
         // Use stat to aquire size of the file
         let size = self.stat(path);
-        if size < 0 || size as usize > KERNEL_HEAP_SIZE {
+        if size <= 0 || size as usize > KERNEL_HEAP_SIZE {
             return None;
         }
 
@@ -239,10 +227,13 @@ impl SCF {
             return None;
         }
         
+        // Close file
+        self.close(fd as _);
+
         Some(data)
     }
 
-    pub fn clone(&mut self) -> isize {
+    pub fn clone_(&mut self) -> isize {
         debug!("sys_clone: slot={}", self.slot_num);
         let cond = SyscallCondVar::new();
         self.send_request(

@@ -2,7 +2,13 @@
 
 mod queue;
 
-pub mod syscall;
+mod syscall;
+
+pub mod fs;
+pub mod task;
+
+pub use fs::*;
+pub use task::*;
 
 use queue::{get_queue, SyscallQueueBuffer};
 use crate::config::scf::{SYSCALL_IPI_IRQ_NUM, SYSCALL_MAX_SLOT_NUM};
@@ -11,13 +17,13 @@ pub fn notify(irq_num: usize) {
     crate::drivers::interrupt::send_ipi(irq_num);
 }
 
+#[derive(Copy, Clone)]
 pub struct SCF {
     pub slot_num: usize,
 }
 
 impl SCF {
     pub fn new(slot_num: usize) -> Self {
-        get_queue(slot_num).reset();
         Self {
             slot_num,
         }

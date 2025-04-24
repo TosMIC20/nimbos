@@ -16,15 +16,14 @@ mod task;
 mod time;
 
 #[cfg(feature = "rvm")]
-use crate::task::CurrentTask;
+use crate::scf::{fs::*, task::*};
 
 #[cfg(feature = "rvm")]
-use crate::scf::syscall::*;
+use self::task::{sys_nanosleep, sys_waitpid};
 
 #[cfg(not(feature = "rvm"))]
-use self::fs::*;
+use self::{fs::*, task::*};
 
-use self::task::*;
 use self::time::*;
 use crate::arch::{instructions, TrapFrame};
 
@@ -36,13 +35,13 @@ pub fn syscall(
     arg2: usize,
 ) -> isize {
     instructions::enable_irqs();
-    trace!(
+    debug!(
         "syscall {} enter <= ({:#x}, {:#x}, {:#x})",
         syscall_id, arg0, arg1, arg2
     );
     let ret = match syscall_id {
-        SYSCALL_READ => sys_read(arg0 as _, arg1.into(), arg2),
-        SYSCALL_WRITE => sys_write(arg0 as _, arg1.into(), arg2),
+        SYSCALL_READ => sys_read(arg0, arg1.into(), arg2),
+        SYSCALL_WRITE => sys_write(arg0, arg1.into(), arg2),
         SYSCALL_YIELD => sys_yield(),
         SYSCALL_NANOSLEEP => sys_nanosleep(arg0.into()),
         SYSCALL_GETPID => sys_getpid(),
@@ -58,7 +57,7 @@ pub fn syscall(
             crate::task::CurrentTask::get().exit(-1);
         }
     };
-    trace!("syscall {} ret => {:#x}", syscall_id, ret);
+    debug!("syscall {} ret => {:#x}", syscall_id, ret);
     instructions::disable_irqs();
     ret
 }

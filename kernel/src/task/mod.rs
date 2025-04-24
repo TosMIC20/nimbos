@@ -50,7 +50,12 @@ pub fn init() {
     m.spawn(ROOT_TASK.clone());
     m.spawn(Task::new_kernel(test_kernel_task, 0xdead));
     m.spawn(Task::new_kernel(test_kernel_task, 0xbeef));
+
+    #[cfg(not(feature = "rvm"))]
     m.spawn(Task::new_user("user_shell"));
+
+    #[cfg(feature = "rvm")]
+    m.spawn(Task::new_user_scf("user_shell"));
 
     TASK_INITED.store(true, Ordering::SeqCst);
 }

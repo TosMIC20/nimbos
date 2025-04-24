@@ -1,17 +1,17 @@
 use alloc::sync::{Arc, Weak};
 use alloc::{boxed::Box, vec::Vec};
-use core::alloc::Layout;
-use core::slice::from_raw_parts;
 use core::sync::atomic::{AtomicI32, AtomicU8, AtomicUsize, Ordering};
 
 use super::manager::{TaskLockedCell, TASK_MANAGER};
 use crate::arch::{instructions, TaskContext, TrapFrame};
-use crate::scf::SCF;
 use crate::config::KERNEL_STACK_SIZE;
 use crate::loader;
-use crate::mm::{kernel_aspace, MemorySet, VirtAddr, UserInPtr, UserOutPtr};
+use crate::mm::{kernel_aspace, MemorySet, VirtAddr};
 use crate::percpu::PerCpu;
 use crate::sync::{LazyInit, Mutex};
+
+#[cfg(feature = "rvm")]
+use crate::scf::SCF;
 
 pub(super) static ROOT_TASK: LazyInit<Arc<Task>> = LazyInit::new();
 
@@ -43,10 +43,12 @@ pub struct Task {
     kstack: Stack<KERNEL_STACK_SIZE>,
     ctx: TaskLockedCell<TaskContext>,
 
-    scf: Option<Mutex<SCF>>,
     vm: Option<Arc<Mutex<MemorySet>>>,
     pub(super) parent: Mutex<Weak<Task>>,
     pub(super) children: Mutex<Vec<Arc<Task>>>,
+
+    #[cfg(feature = "rvm")]
+    scf: Option<SCF>,
 }
 
 impl TaskId {
@@ -88,7 +90,6 @@ impl Task {
             state: AtomicU8::new(TaskState::Ready as u8),
             entry: EntryState::Kernel { pc: 0, arg: 0 },
             exit_code: AtomicI32::new(0),
-            scf: None,
 
             kstack: Stack::default(),
             ctx: TaskLockedCell::new(TaskContext::default()),
@@ -96,6 +97,9 @@ impl Task {
             vm: None,
             parent: Mutex::new(Weak::default()),
             children: Mutex::new(Vec::new()),
+
+            #[cfg(feature = "rvm")]
+            scf: None,
         }
     }
 
@@ -133,15 +137,31 @@ impl Task {
     }
 
     pub fn new_user(path: &str) -> Arc<Self> {
+        let elf_data = loader::get_app_data_by_name(path).expect("new_user: no such app");
+        let mut vm = MemorySet::new();
+        let (entry, ustack_top) = vm.load_user(elf_data);
+
+        let mut t = Self::new_common(TaskId::alloc());
+        t.entry = EntryState::User(Box::new(TrapFrame::new_user(entry, ustack_top, 0)));
+        t.ctx
+            .get_mut()
+            .init(task_entry as _, t.kstack.top(), vm.page_table_root(), false);
+        t.vm = Some(Arc::new(Mutex::new(vm)));
+
+        let t = Arc::new(t);
+        ROOT_TASK.add_child(&t);
+        t
+    }
+
+    #[cfg(feature = "rvm")]
+    pub fn new_user_scf(path: &str) -> Arc<Self> {
         let mut t = Self::new_common(TaskId::alloc());
         // Must set SCF before setting memory set
-        t.scf = Some(Mutex::new(SCF::new(0)));
-        let mut scf = t.scf.as_mut().unwrap().lock();
+        t.scf = Some(SCF::new(0));
 
         let elf_data = loader::get_app_data_by_name(path).expect("new_user: no such app");
         let mut vm = MemorySet::new();
-        let (entry, ustack_top) = vm.load_user(elf_data, &mut Some(&mut *scf));
-        drop(scf);
+        let (entry, ustack_top) = vm.load_user_sync(elf_data, t.scf);
 
         t.entry = EntryState::User(Box::new(TrapFrame::new_user(entry, ustack_top, 0)));
         t.ctx
@@ -173,12 +193,27 @@ impl Task {
         t
     }
 
-    pub fn new_fork(self: &Arc<Self>, tf: &TrapFrame, slot_num: usize) -> Arc<Self> {
+    pub fn new_fork(self: &Arc<Self>, tf: &TrapFrame) -> Arc<Self> {
         assert!(!self.is_kernel_task());
         let mut t = Self::new_common(TaskId::alloc());
-        let mut scf_instance =SCF::new(slot_num);
-        let vm = self.vm.as_ref().unwrap().lock().dup(&mut Some(&mut scf_instance));
-        t.scf = Some(Mutex::new(scf_instance));
+        let vm = self.vm.as_ref().unwrap().lock().dup();
+        t.entry = EntryState::User(Box::new(tf.new_fork()));
+        t.ctx
+            .get_mut()
+            .init(task_entry as _, t.kstack.top(), vm.page_table_root(), false);
+        t.vm = Some(Arc::new(Mutex::new(vm)));
+
+        let t = Arc::new(t);
+        self.add_child(&t);
+        t
+    }
+
+    #[cfg(feature = "rvm")]
+    pub fn new_fork_scf(self: &Arc<Self>, tf: &TrapFrame, slot_num: usize) -> Arc<Self> {
+        assert!(!self.is_kernel_task());
+        let mut t = Self::new_common(TaskId::alloc());
+        t.scf = Some(SCF::new(slot_num));
+        let vm = self.vm.as_ref().unwrap().lock().dup_sync(t.scf);
         t.entry = EntryState::User(Box::new(tf.new_fork()));
         t.ctx
             .get_mut()
@@ -195,10 +230,6 @@ impl Task {
 
     pub const fn is_kernel_task(&self) -> bool {
         self.is_kernel
-    }
-
-    pub const fn is_scf_task(&self) -> bool {
-        self.scf.is_some()
     }
 
     pub const fn is_root(&self) -> bool {
@@ -273,7 +304,7 @@ impl<'a> CurrentTask<'a> {
         info!("task exit with code {}", exit_code);
         if let Some(vm) = self.vm.as_ref() {
             if Arc::strong_count(vm) == 1 {
-                vm.lock().clear(&mut None); // drop memory set before lock
+                vm.lock().clear(); // drop memory set before lock
             }
         }
         TASK_MANAGER.lock().exit_current(self, exit_code)
@@ -284,9 +315,8 @@ impl<'a> CurrentTask<'a> {
         assert_eq!(Arc::strong_count(self.vm.as_ref().unwrap()), 1);
         if let Some(elf_data) = loader::get_app_data_by_name(path) {
             let mut vm = self.vm.as_ref().unwrap().lock();
-            let mut scf = self.scf.as_ref().unwrap().lock();
-            vm.clear(&mut Some(&mut *scf));
-            let (entry, ustack_top) = vm.load_user(elf_data, &mut Some(&mut *scf));
+            vm.clear();
+            let (entry, ustack_top) = vm.load_user(elf_data);
             *tf = TrapFrame::new_user(entry, ustack_top, 0);
             instructions::flush_tlb_all();
             0
@@ -315,50 +345,80 @@ impl<'a> CurrentTask<'a> {
             -1
         }
     }
-
-    pub fn exec_data(&self, elf_data: &[u8], tf: &mut TrapFrame) {
-        let mut vm = self.vm.as_ref().unwrap().lock();
-        let mut scf = self.scf.as_ref().unwrap().lock();
-        vm.clear(&mut Some(&mut *scf));
-        let (entry, ustack_top) = vm.load_user(elf_data, &mut Some(&mut *scf));
-        *tf = TrapFrame::new_user(entry, ustack_top, 0);
-        instructions::flush_tlb_all();
+    
+    #[cfg(feature = "rvm")]
+    pub fn scf_lexec(&self, path: &str, tf: &mut TrapFrame) -> isize {
+        assert!(!self.is_kernel_task());
+        assert_eq!(Arc::strong_count(self.vm.as_ref().unwrap()), 1);
+        if let Some(elf_data) = loader::get_app_data_by_name(path) {
+            let mut vm = self.vm.as_ref().unwrap().lock();
+            vm.clear_sync(self.scf);
+            let (entry, ustack_top) = vm.load_user_sync(elf_data, self.scf);
+            *tf = TrapFrame::new_user(entry, ustack_top, 0);
+            instructions::flush_tlb_all();
+            0
+        } else {
+            -1
+        }
     }
 
+    #[cfg(feature = "rvm")]
+    pub fn scf_rexec(&self, path: *const u8, tf: &mut TrapFrame) -> isize {
+        if let Some(data) = CurrentTask::get().scf_exec(path) {
+            let mut vm = self.vm.as_ref().unwrap().lock();
+            vm.clear_sync(self.scf);
+            let (entry, ustack_top) = vm.load_user_sync(data.as_slice(), self.scf);
+            *tf = TrapFrame::new_user(entry, ustack_top, 0);
+            instructions::flush_tlb_all();
+            0
+        } else {
+            -1
+        }
+    }
+
+    #[cfg(feature = "rvm")]
     pub fn scf_read(&self, fd: isize, buf: *mut u8, len: usize) -> isize {
-        self.scf.as_ref().unwrap().lock().read(fd, buf, len)
+        self.scf.unwrap().read(fd, buf, len)
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_write(&self, fd: isize, buf: *const u8, len: usize) -> isize {
-        self.scf.as_ref().unwrap().lock().write(fd, buf, len)
+        self.scf.unwrap().write(fd, buf, len)
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_open(&self, path: *const u8, flags: usize, mode: usize) -> isize {
-        self.scf.as_ref().unwrap().lock().open(path, flags, mode)
+        self.scf.unwrap().open(path, flags, mode)
     }
 
-    pub fn scf_close(&self, fd: usize) -> isize {
-        self.scf.as_ref().unwrap().lock().close(fd)
+    #[cfg(feature = "rvm")]
+    pub fn scf_close(&self, fd: isize) -> isize {
+        self.scf.unwrap().close(fd)
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_syncfork(&self) -> isize {
-        self.scf.as_ref().unwrap().lock().syncfork()
+        self.scf.unwrap().syncfork()
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_stat(&self, path: *const u8) -> isize {
-        self.scf.as_ref().unwrap().lock().stat(path)
+        self.scf.unwrap().stat(path)
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_exec(&self, path: *const u8) -> Option<Vec<u8>> {
-        self.scf.as_ref().unwrap().lock().exec(path)
+        self.scf.unwrap().exec(path)
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_clone(&self) -> isize {
-        self.scf.as_ref().unwrap().lock().clone()
+        self.scf.unwrap().clone_()
     }
 
+    #[cfg(feature = "rvm")]
     pub fn scf_exit(&self) -> isize {
-        self.scf.as_ref().unwrap().lock().exit()
+        self.scf.unwrap().exit()
     }
 }
 
